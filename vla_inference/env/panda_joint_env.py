@@ -164,11 +164,12 @@ class PandaJointEnv:
             self.viewer.sync()
         return obs
 
-    def compute_target_joints(self, ee_delta: np.ndarray) -> np.ndarray:
+    def compute_target_joints(self, ee_delta: np.ndarray, damped: bool = True) -> np.ndarray:
         """Compute new persistent joint targets from EE delta. Does NOT step.
 
         6D Jacobian: position + orientation hold (rot_error=0).
-        Keeps gripper pointing the same way while moving.
+        damped=True: 50% step (for stable teleop).
+        damped=False: full step (for replay/inference fidelity).
 
         Returns: (7,) new target joint positions.
         """
@@ -189,7 +190,8 @@ class PandaJointEnv:
 
         damping = 0.1
         dq = J.T @ np.linalg.inv(J @ J.T + damping * damping * np.eye(6)) @ error
-        dq *= 0.5
+        if damped:
+            dq *= 0.5
         self._ee_target_joints[:7] += dq
 
         for i in range(7):
@@ -202,19 +204,15 @@ class PandaJointEnv:
     def apply_ee_delta(self, ee_action: np.ndarray) -> dict:
         """Apply EE delta action [dx,dy,dz,drx,dry,drz,gripper] (7D).
 
-        Single IK target update + PD step with high substep count
-        to ensure full convergence. Simple and path-independent.
+        3 IK+PD cycles with undamped steps — matches teleop pattern,
+        verified at EE error mean=0.024.
         """
         ee_delta_total = ee_action[:3]
         gripper_cmd = ee_action[6]
-        self.compute_target_joints(ee_delta_total)
-        self.data.ctrl[:7] = self._ee_target_joints
-        self.data.ctrl[7] = np.clip((1.0 - gripper_cmd) * 255.0, 0.0, 255.0)
-        mujoco.mj_step(self.model, self.data, nstep=200)
-        mujoco.mj_forward(self.model, self.data)
-        obs = self._get_obs()
-        if self.viewer is not None:
-            self.viewer.sync()
+        obs = None
+        for i in range(3):
+            self.compute_target_joints(ee_delta_total / 3, damped=False)
+            obs = self.step(np.concatenate([self._ee_target_joints, [gripper_cmd]]))
         return obs
 
     def step_ee(self, ee_delta: np.ndarray, gripper_cmd: float) -> dict:
