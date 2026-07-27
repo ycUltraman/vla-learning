@@ -28,7 +28,7 @@ policy:
   output_features:
     action:
       type: ACTION
-      shape: [7]
+      shape: [8]
   use_relative_actions: false
 
 peft:

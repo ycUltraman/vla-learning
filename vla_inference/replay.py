@@ -73,13 +73,13 @@ def main():
         for i in range(n_frames):
             t0 = time.perf_counter()
             t0 = time.perf_counter()
-            obs = env.apply_ee_delta(actions[i])
+            obs = env.step(actions[i])
             replay_ee[i] = obs["observation.state"][8:11]
 
             ee_err = np.linalg.norm(replay_ee[i] - states[i][8:11])
 
             if i % args.fps == 0 or i < 5:
-                print(f"  [{i:3d}] grip={actions[i][6]:.1f} | "
+                print(f"  [{i:3d}] grip={actions[i][7]:.1f} | "
                       f"ee={obs['observation.state'][8:11].round(3)} "
                       f"target={states[i][8:11].round(3)} "
                       f"ee_err={ee_err:.4f}")
