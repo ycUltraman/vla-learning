@@ -11,9 +11,9 @@ Cartesian (end-effector) control via Jacobian IK:
 
 Flow: auto reset → 2s wait → control arm → complete task → auto save → repeat
 
-Records joint action format:
+Records in EE-delta format:
   state:  15D [joint1..7, gripper_width, ee_xyz, ee_quat_wxyz]
-  action:  8D [joint1..7 targets, gripper_cmd 0-1]
+  action:  7D [dx, dy, dz, drx, dry, drz, gripper_cmd 0-1]
   images: front (640x480) + wrist (640x480)
 
 Usage:
@@ -227,13 +227,20 @@ def main():
                     last_ctrl = t_now
                     continue
 
+                # Accumulate EE delta across control cycles for this recording frame
+                if step_in_ep % record_every == 0:
+                    _ee_accum_start = env.ee_position.copy()  # record before any cycle
+
                 env.compute_target_joints(ee_delta)
-                action = np.concatenate([env._ee_target_joints.copy(), [grip_cmd]])
-                obs = env.step(action)
+                obs = env.step(np.concatenate([env._ee_target_joints, [grip_cmd]]))
                 last_ctrl = t_now
+
                 step_in_ep += 1
 
+                # Record full inter-frame EE delta (all cycles since last recording)
                 if step_in_ep % record_every == 0:
+                    ee_delta_total = env.ee_position - _ee_accum_start
+                    action = np.concatenate([ee_delta_total, [0.0, 0.0, 0.0], [grip_cmd]])
                     data["states"].append(obs["observation.state"].copy())
                     data["images_front"].append(obs["observation.images.front"].copy())
                     data["images_wrist"].append(obs["observation.images.wrist"].copy())
@@ -286,7 +293,7 @@ def _save_episode(ep_dir: Path, data: dict, task: str = "", fps: int = 10):
     np.savez_compressed(ep_dir / "images_wrist.npz", frames=wrist)
 
     with open(ep_dir / "meta.json", "w") as f:
-        json.dump({"steps": n, "state_dim": 15, "action_dim": 8, "task": task}, f)
+        json.dump({"steps": n, "state_dim": 15, "action_dim": 7, "task": task}, f)
 
     print(f"\n  Saved {n} frames → {ep_dir}")
 

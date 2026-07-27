@@ -90,10 +90,10 @@ def main():
             # Safety checks
             if np.any(np.isnan(action)):
                 raise RuntimeError(f"NaN action at step {step}: {action}")
-            if np.max(np.abs(action[:7])) > 5:  # joint > 5 rad is unsafe
+            if np.max(np.abs(action[:6])) > 0.5:  # EE delta > 50cm is unsafe
                 raise RuntimeError(f"Action too large at step {step}: {action[:7]}")
 
-            obs = env.step(action)
+            obs = env.apply_ee_delta(action)
 
             latency = (time.perf_counter() - t0) * 1000
 
