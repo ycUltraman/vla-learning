@@ -181,6 +181,10 @@ class PandaJointEnv:
         if damped:
             dq *= 0.5
         self._ee_target_joints[:7] += dq
+        # Clamp wrist joints 5/6/7 to home for downward gripper orientation
+        self._ee_target_joints[4] = self.HOME_QPOS[4]  # joint5
+        self._ee_target_joints[5] = self.HOME_QPOS[5]  # joint6
+        self._ee_target_joints[6] = self.HOME_QPOS[6]  # joint7
 
         for i in range(7):
             lo = self.model.jnt_range[i][0]
