@@ -149,19 +149,6 @@ def main():
         sys.exit(1)
 
     env = PandaJointEnv(render_mode="human", scene="task")
-    # Side view camera for teleop guidance
-    _cam_side = mujoco.MjvCamera()
-    _cam_side.type = mujoco.mjtCamera.mjCAMERA_FREE
-    _cam_side.lookat = np.array([0.45, 0.0, 0.05])
-    _cam_side.distance = 0.7
-    _cam_side.azimuth = 90.0
-    _cam_side.elevation = -10.0
-    import mujoco as _mj
-    # Create a small Pygame window for side view
-    _side_screen = pygame.display.set_mode((320, 240))
-    pygame.display.set_caption("Side View")
-    # Use the env renderer for side view
-    _side_renderer = env._renderer
     obs = env.reset()
 
     out_dir = Path(args.output)
@@ -190,6 +177,17 @@ def main():
     import pygame
     import mujoco
     clock = pygame.time.Clock()
+
+    # Side view camera for teleop guidance
+    _cam_side = mujoco.MjvCamera()
+    _cam_side.type = mujoco.mjtCamera.mjCAMERA_FREE
+    _cam_side.lookat = np.array([0.45, 0.0, 0.05])
+    _cam_side.distance = 0.7
+    _cam_side.azimuth = 90.0
+    _cam_side.elevation = -10.0
+    _side_screen = pygame.display.set_mode((320, 240))
+    pygame.display.set_caption("Side View")
+    _side_renderer = env._renderer
 
     def _new_episode():
         nonlocal step_in_ep, active, data, current_grip
