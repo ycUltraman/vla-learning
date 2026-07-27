@@ -175,19 +175,7 @@ def main():
     print("=" * 50 + "\n")
 
     import pygame
-    import mujoco
     clock = pygame.time.Clock()
-
-    # Side view camera for teleop guidance
-    _cam_side = mujoco.MjvCamera()
-    _cam_side.type = mujoco.mjtCamera.mjCAMERA_FREE
-    _cam_side.lookat = np.array([0.45, 0.0, 0.05])
-    _cam_side.distance = 0.7
-    _cam_side.azimuth = 90.0
-    _cam_side.elevation = -10.0
-    _side_screen = pygame.display.set_mode((320, 240))
-    pygame.display.set_caption("Side View")
-    _side_renderer = env._renderer
 
     def _new_episode():
         nonlocal step_in_ep, active, data, current_grip
@@ -250,14 +238,6 @@ def main():
                     data["images_front"].append(obs["observation.images.front"].copy())
                     data["images_wrist"].append(obs["observation.images.wrist"].copy())
                     data["actions"].append(action.copy())
-
-                # Render side view for teleop guidance
-                _side_renderer.update_scene(env.data, camera=_cam_side)
-                side_img = _side_renderer.render()
-                side_surf = pygame.surfarray.make_surface(
-                    np.transpose(side_img, (1, 0, 2)))
-                _side_screen.blit(side_surf, (0, 0))
-                pygame.display.flip()
 
                 n = len(data["states"])
                 sys.stdout.write(f"\r  Frames: {n:4d}/{MAX_STEPS}")
