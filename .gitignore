@@ -1,0 +1,7 @@
+*.tar.gz
+collected_episodes/
+collected_episodes2/
+collected_episodes3/
+*.png
+*.txt
+replay_frames/
