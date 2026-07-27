@@ -165,31 +165,19 @@ class PandaJointEnv:
         return obs
 
     def compute_target_joints(self, ee_delta: np.ndarray, damped: bool = True) -> np.ndarray:
-        """Compute new persistent joint targets from EE delta. Does NOT step.
+        """3D Damped Least Squares IK for EE delta → joint targets.
 
-        6D Jacobian: position + orientation hold (rot_error=0).
-        damped=True: 50% step (for stable teleop).
-        damped=False: full step (for replay/inference fidelity).
-
-        Returns: (7,) new target joint positions.
+        Uses 3D position-only Jacobian (7 joints) with DLS for stability.
         """
         ee_delta = np.asarray(ee_delta, dtype=np.float64)
         mujoco.mj_forward(self.model, self.data)
 
         jac_pos = np.zeros((3, self.model.nv))
-        jac_rot = np.zeros((3, self.model.nv))
-        mujoco.mj_jacBody(self.model, self.data, jac_pos, jac_rot, self._hand_body_id)
-        Jp = jac_pos[:, :7]
-        Jr = jac_rot[:, :7]
+        mujoco.mj_jacBody(self.model, self.data, jac_pos, None, self._hand_body_id)
+        J = jac_pos[:, :7]  # (3, 7)
 
-        pos_error = ee_delta
-        rot_error = np.zeros(3)
-
-        error = np.concatenate([pos_error, rot_error])
-        J = np.vstack([Jp, Jr])
-
-        damping = 0.1
-        dq = J.T @ np.linalg.inv(J @ J.T + damping * damping * np.eye(6)) @ error
+        lam = 0.05
+        dq = J.T @ np.linalg.inv(J @ J.T + lam * lam * np.eye(3)) @ ee_delta
         if damped:
             dq *= 0.5
         self._ee_target_joints[:7] += dq
