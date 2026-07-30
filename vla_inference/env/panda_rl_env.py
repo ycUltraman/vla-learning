@@ -14,6 +14,11 @@ _PROJECT_ROOT = Path(__file__).parent.parent.parent
 _TASK_SCENE = str(
     _PROJECT_ROOT / "mujoco_menagerie" / "franka_emika_panda" / "scene_task.xml"
 )
+# Fallback: check common locations for the scene file
+if not Path(_TASK_SCENE).exists():
+    _ALT = Path("/root/autodl-tmp/mujoco_menagerie/franka_emika_panda/scene_task.xml")
+    if _ALT.exists():
+        _TASK_SCENE = str(_ALT)
 
 
 class PandaRLEnv:

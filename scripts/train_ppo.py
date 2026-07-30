@@ -178,7 +178,8 @@ def main():
 
         # PPO update after each episode
         obs_b, act_b, rew_b, old_lp_b, val_b, dones_b = buffer.get_batch()
-        adv_b, ret_b = compute_gae(rew_b, val_b, dones_b)
+        rew_b = rew_b.to(device); dones_b = dones_b.to(device)
+        adv_b, ret_b = compute_gae(rew_b, val_b.squeeze(-1), dones_b)
 
         ppo_update(ac, optimizer, obs_b.to(device), act_b.to(device),
                    old_lp_b.to(device), adv_b.to(device), ret_b.to(device))
