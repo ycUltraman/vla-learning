@@ -165,26 +165,33 @@ class PandaJointEnv:
         return obs
 
     def compute_target_joints(self, ee_delta: np.ndarray, damped: bool = True) -> np.ndarray:
-        """3D Damped Least Squares IK for EE delta → joint targets.
+        """6D DLS IK: track EE position delta while holding orientation.
 
-        Uses 3D position-only Jacobian (7 joints) with DLS for stability.
+        Uses full 6D Jacobian (position + rotation) with rot_error=0
+        to prevent the gripper from tilting during movement.
+        damped=True: 50% step for stable teleop.
+        damped=False: full step for replay/inference.
         """
         ee_delta = np.asarray(ee_delta, dtype=np.float64)
         mujoco.mj_forward(self.model, self.data)
 
         jac_pos = np.zeros((3, self.model.nv))
-        mujoco.mj_jacBody(self.model, self.data, jac_pos, None, self._hand_body_id)
-        J = jac_pos[:, :7]  # (3, 7)
+        jac_rot = np.zeros((3, self.model.nv))
+        mujoco.mj_jacBody(self.model, self.data, jac_pos, jac_rot, self._hand_body_id)
+        Jp = jac_pos[:, :7]
+        Jr = jac_rot[:, :7]
 
-        lam = 0.05
-        dq = J.T @ np.linalg.inv(J @ J.T + lam * lam * np.eye(3)) @ ee_delta
+        pos_error = ee_delta
+        rot_error = np.zeros(3)  # hold current orientation
+
+        error = np.concatenate([pos_error, rot_error])
+        J = np.vstack([Jp, Jr])
+
+        damping = 0.03
+        dq = J.T @ np.linalg.inv(J @ J.T + damping * damping * np.eye(6)) @ error
         if damped:
             dq *= 0.5
         self._ee_target_joints[:7] += dq
-        # Clamp wrist joints 5/6/7 to home for downward gripper orientation
-        self._ee_target_joints[4] = self.HOME_QPOS[4]  # joint5
-        self._ee_target_joints[5] = self.HOME_QPOS[5]  # joint6
-        self._ee_target_joints[6] = self.HOME_QPOS[6]  # joint7
 
         for i in range(7):
             lo = self.model.jnt_range[i][0]
@@ -273,6 +280,4 @@ class PandaJointEnv:
         return self._get_obs()
 
 
-def _quat_conj(q):
-    """Quaternion conjugate: (w,x,y,z) → (w,-x,-y,-z)."""
-    return np.array([q[0], -q[1], -q[2], -q[3]])
+
