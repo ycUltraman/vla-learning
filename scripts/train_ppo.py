@@ -138,9 +138,10 @@ def ppo_update(ac, optimizer, obs, actions, old_log_probs, advantages, returns,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=2000)
-    parser.add_argument("--render", action="store_true")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--save", type=str, default="./rl_checkpoint.pt")
+    parser.add_argument("--bc_init", type=str, default=None,
+                        help="Path to BC checkpoint for weight initialization")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -148,6 +149,19 @@ def main():
 
     env = PandaRLEnv()
     ac = ActorCritic(obs_dim=14, act_dim=4, hidden=256).to(device)
+
+    # Load BC pretrained weights if provided
+    if args.bc_init:
+        bc = torch.load(args.bc_init, map_location=device)
+        bc_state = bc["model_state"]
+        ac.shared[0].weight.data.copy_(bc_state["net.0.weight"])
+        ac.shared[0].bias.data.copy_(bc_state["net.0.bias"])
+        ac.shared[2].weight.data.copy_(bc_state["net.2.weight"])
+        ac.shared[2].bias.data.copy_(bc_state["net.2.bias"])
+        ac.actor_mean.weight.data.copy_(bc_state["net.4.weight"])
+        ac.actor_mean.bias.data.copy_(bc_state["net.4.bias"])
+        print(f"Loaded BC init from {args.bc_init}")
+
     optimizer = torch.optim.Adam(ac.parameters(), lr=args.lr)
     buffer = RolloutBuffer()
     reward_history = deque(maxlen=50)

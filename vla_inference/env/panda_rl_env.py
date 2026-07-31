@@ -31,16 +31,24 @@ class PandaRLEnv:
     CUBE_HALF = 0.03
 
     # Task config
-    MAX_STEPS = 200
-    GRASP_Z = 0.06      # z height to consider "reached cube"
-    LIFT_Z = 0.15       # z height to consider "lifted cube"
-    GRASP_THRESH = 0.03  # xy distance to consider "above cube"
-    SUCCESS_Z = 0.12     # cube z above this = success
+    MAX_STEPS = 300
+    SUCCESS_Z = 0.10    # cube z > 0.10 = success (cube starts at 0.03, lifted >7cm)
 
     def __init__(self):
         self.model = mujoco.MjModel.from_xml_path(_TASK_SCENE)
         self.data = mujoco.MjData(self.model)
         self._resolve_ids()
+
+        # Image rendering for PI0.5 input
+        self._renderer = mujoco.Renderer(self.model, 480, 640)
+        self._cam_front = mujoco.MjvCamera()
+        self._cam_front.type = mujoco.mjtCamera.mjCAMERA_FREE
+        self._cam_front.lookat = np.array([0.6, -0.1, 0.32])
+        self._cam_front.distance = 0.50
+        self._cam_front.azimuth = 180
+        self._cam_front.elevation = -25.0
+        self._wrist_cam_name = "wrist_cam"
+
         self._ee_target_joints = None
         self._step_count = 0
 
@@ -53,9 +61,19 @@ class PandaRLEnv:
         mujoco.mj_forward(self.model, self.data)
         self._ee_target_joints = self.joint_positions.copy()
         self._step_count = 0
-        self._cube_attached = False
         self._grasped = False
         self._success = False
+        self._init_cube = self.cube_position.copy()  # fixed target, never changes
+        self._prev_dist = self._dist_to_target()
+        self._prev_ee = self.ee_position.copy()
+        # Reward breakdown tracking
+        self._rew_progress = 0.0
+        self._rew_pose = 0.0
+        self._rew_grasp = 0.0
+        self._rew_success = 0.0
+        self._rew_attempt = 0.0
+        self._rew_step = 0.0
+        self._rew_terminal = 0.0
         return self._get_obs(), {}
 
     def step(self, action: np.ndarray):
@@ -63,6 +81,9 @@ class PandaRLEnv:
         action = np.asarray(action, dtype=np.float64)
         ee_delta = action[:3]
         gripper_cmd = float(np.clip(action[3], 0.0, 1.0))
+
+        # Track gripper transition for grasp-attempt detection
+        prev_grip = self.gripper_width
 
         # Apply EE delta via 6D IK
         self._compute_ik(ee_delta)
@@ -74,9 +95,21 @@ class PandaRLEnv:
         self._step_count += 1
         self._check_grasp()
         obs = self._get_obs()
-        reward = self._compute_reward()
+
+        # Detect grasp attempt: gripper transitioned from open to closed
+        grasp_attempt = (prev_grip > 0.05 and self.gripper_width < 0.04
+                         and not self._grasped and not self._success)
+        if grasp_attempt:
+            self._grasp_attempted = True
+
+        reward = self._compute_reward(grasp_attempt)
         terminated = self._success
         truncated = self._step_count >= self.MAX_STEPS
+
+        # Terminal penalty: timeout without success
+        if truncated and not self._success:
+            reward -= 5.0   # light — success +500 dominates
+            self._rew_terminal -= 5.0
 
         return obs, reward, terminated, truncated, {}
 
@@ -120,26 +153,56 @@ class PandaRLEnv:
         self._hand_body_id = n2i(mujoco.mjtObj.mjOBJ_BODY, "hand")
         self._cube_body_id = n2i(mujoco.mjtObj.mjOBJ_BODY, "red_cube")
 
+    # Training data cube positions (must match BC training distribution)
+    CUBE_POSITIONS = [
+        np.array([0.45, -0.20, 0.03]),
+        np.array([0.45,  0.00, 0.03]),
+        np.array([0.45,  0.20, 0.03]),
+    ]
+
     def _randomize_cube(self):
-        """Randomize cube position within workspace."""
-        x = np.random.uniform(0.35, 0.55)
-        y = np.random.uniform(-0.30, 0.30)
+        """Randomly pick one of the 3 BC training positions."""
+        pos = self.CUBE_POSITIONS[np.random.randint(0, 3)]
         self.data.qpos[
             self.model.jnt_qposadr[
                 self.model.body_jntadr[self._cube_body_id]
             ]:self.model.jnt_qposadr[
                 self.model.body_jntadr[self._cube_body_id]
             ] + 3
-        ] = [x, y, self.CUBE_HALF]
+        ] = [pos[0], pos[1], self.CUBE_HALF]
 
     def _get_obs(self) -> np.ndarray:
-        """14D state vector."""
+        """14D state vector (for state-only RL)."""
         return np.concatenate([
             self.joint_positions,      # 7
             self.ee_position,           # 3
             self.cube_position,         # 3
             [self.gripper_width],       # 1
         ]).astype(np.float32)
+
+    def get_obs_pi05(self) -> dict:
+        """Return PI0.5-compatible observation dict (15D state + images)."""
+        # 15D state = [j1..j7, grip_w, ee_xyz, quat_wxyz] (matches training)
+        quat = np.zeros(4)
+        mujoco.mju_mat2Quat(quat, self.data.xmat[self._hand_body_id])
+        state = np.concatenate([
+            self.joint_positions,       # 7
+            [self.gripper_width],       # 1
+            self.ee_position,           # 3
+            quat,                       # 4
+        ]).astype(np.float32)
+
+        # Render images
+        self._renderer.update_scene(self.data, camera=self._cam_front)
+        front = self._renderer.render()
+        self._renderer.update_scene(self.data, camera=self._wrist_cam_name)
+        wrist = self._renderer.render()
+
+        return {
+            "observation.state": state,
+            "observation.images.front": front,
+            "observation.images.wrist": wrist,
+        }
 
     def _compute_ik(self, ee_delta: np.ndarray):
         """6D DLS IK — same as panda_joint_env."""
@@ -157,45 +220,71 @@ class PandaRLEnv:
             self._ee_target_joints[i] = np.clip(self._ee_target_joints[i], lo, hi)
 
     def _check_grasp(self):
-        """Check if cube is grasped (between fingers)."""
-        dist = np.linalg.norm(self.ee_position[:2] - self.cube_position[:2])
-        z_diff = abs(self.ee_position[2] - self.cube_position[2] - self.CUBE_HALF)
-        if dist < self.GRASP_THRESH and z_diff < 0.02 and self.gripper_width < 0.02:
-            self._grasped = True
-        if self._grasped and self.cube_position[2] > self.SUCCESS_Z:
-            self._success = True
+        """Cube Z height — grasped resets if cube drops back to table."""
+        cz = self.cube_position[2]
+        self._grasped = cz > 0.06      # reset if cube falls back
+        if cz > 0.10:
+            self._success = True        # permanent once achieved
 
-    def _compute_reward(self) -> float:
-        """Dense reward: approach + grasp + lift."""
-        ee = self.ee_position
-        cube = self.cube_position
+    def _dist_to_target(self) -> float:
+        """3D distance from EE to INITIAL cube position (fixed target)."""
+        target = np.array([
+            self._init_cube[0],
+            self._init_cube[1],
+            self._init_cube[2] + self.CUBE_HALF + 0.01,
+        ])
+        return float(np.linalg.norm(self.ee_position - target))
 
-        # Distance reward (negative L2, scaled)
-        xy_dist = np.linalg.norm(ee[:2] - cube[:2])
-        z_dist = abs(ee[2] - (cube[2] + self.CUBE_HALF + 0.01))
-        r_approach = -xy_dist - 0.5 * z_dist
+    def _compute_reward(self, grasp_attempt: bool = False) -> float:
+        """Progress + grasp-pose bonus + grasp/success + attempt penalty."""
+        dist = self._dist_to_target()
+        # Use INITIAL cube position for XY/Z distance — fixed target, not pushed cube
+        xy_dist = float(np.linalg.norm(self.ee_position[:2] - self._init_cube[:2]))
+        z_diff = abs(self.ee_position[2] - (self._init_cube[2] + self.CUBE_HALF + 0.01))
 
-        # Grasp bonus
-        r_grasp = 0.0
+        progress = self._prev_dist - dist
+        r_prog = 2.0 * progress
+        r = r_prog
+        self._rew_progress += r_prog
+
+        # Pose reward: XY × Z — both must be correct, not just XY
+        xy_score = max(0.0, 1.0 - xy_dist / 0.15)
+        z_diff = abs(self.ee_position[2] - (self.cube_position[2] + self.CUBE_HALF + 0.01))
+        z_score = max(0.0, 1.0 - z_diff / 0.10)
+        r_pose = 0.2 * xy_score * z_score  # heavily reduced — max ~0.2/step
+        r += r_pose
+        self._rew_pose += r_pose
+
+        # Grip reward: only when XY near AND Z close to grasp height
+        z_target = self.cube_position[2] + self.CUBE_HALF + 0.01
+        z_err_grip = abs(self.ee_position[2] - z_target)
+        if self.gripper_width < 0.04 and xy_dist < 0.08 and z_err_grip < 0.08:
+            r += 2.0  # meaningful: XY correct + Z close + grip closed
+
+        # Grasp bonus (one-time)
         if self._grasped and not getattr(self, '_grasp_bonus_given', False):
-            r_grasp = 5.0
+            r += 100.0
+            self._rew_grasp += 100.0
             self._grasp_bonus_given = True
 
-        # Success bonus
-        r_success = 0.0
+        # Success bonus (dominant — must dwarf all other rewards)
         if self._success and not getattr(self, '_success_bonus_given', False):
-            r_success = 20.0
+            r += 500.0
+            self._rew_success += 500.0
             self._success_bonus_given = True
 
-        # Gripper penalty: encourage closing near cube
-        r_grip = 0.0
-        if xy_dist < self.GRASP_THRESH * 2:
-            r_grip = 0.1 * (1.0 - self.gripper_width / 0.08)  # reward closing
+        # Grasp attempt penalty (one-time)
+        if grasp_attempt:
+            penalty = 0.2 if dist < 0.10 else 1.0
+            r -= penalty
+            self._rew_attempt -= penalty
 
-        # Step penalty to encourage speed
-        r_step = -0.01
+        r_step = -0.005
+        r += r_step
+        self._rew_step += r_step
 
-        return r_approach + r_grasp + r_success + r_grip + r_step
+        self._prev_dist = dist
+        return float(r)
 
     def close(self):
         pass
