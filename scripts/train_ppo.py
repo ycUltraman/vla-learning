@@ -17,8 +17,8 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from vla_inference.env.panda_rl_env import PandaRLEnv
+sys.path.insert(0, str(Path(__file__).parent))
+from panda_rl_env import PandaRLEnv
 
 
 # ── Actor-Critic Network ───────────────────────────────────────
@@ -148,23 +148,39 @@ def main():
     print(f"Device: {device}")
 
     env = PandaRLEnv()
+    # State-only PPO needs a simpler reward: pure distance + success
+    # Override the complex reward designed for PI0.5 residual PPO
+    env._simple_reward = True
     ac = ActorCritic(obs_dim=14, act_dim=4, hidden=256).to(device)
 
-    # Load BC pretrained weights if provided
+    # Load pretrained weights if provided
     if args.bc_init:
-        bc = torch.load(args.bc_init, map_location=device)
+        bc = torch.load(args.bc_init, map_location=device, weights_only=False)
         bc_state = bc["model_state"]
-        ac.shared[0].weight.data.copy_(bc_state["net.0.weight"])
-        ac.shared[0].bias.data.copy_(bc_state["net.0.bias"])
-        ac.shared[2].weight.data.copy_(bc_state["net.2.weight"])
-        ac.shared[2].bias.data.copy_(bc_state["net.2.bias"])
-        ac.actor_mean.weight.data.copy_(bc_state["net.4.weight"])
-        ac.actor_mean.bias.data.copy_(bc_state["net.4.bias"])
-        print(f"Loaded BC init from {args.bc_init}")
+        # Handle old BC format (net.X) and distilled format (Sequential: X)
+        key_map = [("net.0", "0"), ("net.2", "2"), ("net.4", "4")]
+        for old_key, new_key in key_map:
+            src_w = bc_state.get(f"{old_key if old_key in bc_state else new_key}.weight",
+                                 bc_state.get(f"{new_key}.weight"))
+            src_b = bc_state.get(f"{old_key if old_key in bc_state else new_key}.bias",
+                                 bc_state.get(f"{new_key}.bias"))
+            if src_w is None: continue
+        # Map: distilled[0,2,4] → ac shared[0], shared[2], actor_mean
+        mapping = [
+            (0, ac.shared[0]), (2, ac.shared[2]), (4, ac.actor_mean),
+        ]
+        for src_idx, dst in mapping:
+            w_key = f"{src_idx}.weight"
+            b_key = f"{src_idx}.bias"
+            if w_key in bc_state:
+                dst.weight.data.copy_(bc_state[w_key])
+                dst.bias.data.copy_(bc_state[b_key])
+        print(f"Loaded init from {args.bc_init}")
 
     optimizer = torch.optim.Adam(ac.parameters(), lr=args.lr)
     buffer = RolloutBuffer()
     reward_history = deque(maxlen=50)
+    success_count = 0
 
     for ep in range(args.episodes):
         obs, _ = env.reset()
@@ -200,11 +216,13 @@ def main():
 
         buffer.clear()
         reward_history.append(ep_reward)
+        if env._success:
+            success_count += 1
 
-        if ep % 50 == 0:
+        if ep % 10 == 0:
             avg_r = np.mean(reward_history)
-            print(f"Ep {ep:4d}/{args.episodes} | avg_reward: {avg_r:+.2f} | "
-                  f"last_reward: {ep_reward:+.2f} | success: {env._success}")
+            print(f"Ep {ep:4d}/{args.episodes} | avg_r: {avg_r:+.2f} | "
+                  f"r: {ep_reward:+.1f} | succ: {success_count}/{ep+1}")
 
         if (ep + 1) % 500 == 0:
             torch.save({"ac_state": ac.state_dict(), "opt_state": optimizer.state_dict()}, args.save)

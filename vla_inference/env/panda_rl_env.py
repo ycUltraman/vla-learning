@@ -66,6 +66,7 @@ class PandaRLEnv:
         self._init_cube = self.cube_position.copy()  # fixed target, never changes
         self._prev_dist = self._dist_to_target()
         self._prev_ee = self.ee_position.copy()
+        self._prev_grip = self.gripper_width
         # Reward breakdown tracking
         self._rew_progress = 0.0
         self._rew_pose = 0.0
@@ -74,6 +75,9 @@ class PandaRLEnv:
         self._rew_attempt = 0.0
         self._rew_step = 0.0
         self._rew_terminal = 0.0
+        self._min_pose_dist = float('inf')
+        self._ever_near_grasp = False
+        self._idle_near = 0
         return self._get_obs(), {}
 
     def step(self, action: np.ndarray):
@@ -85,11 +89,12 @@ class PandaRLEnv:
         # Track gripper transition for grasp-attempt detection
         prev_grip = self.gripper_width
 
-        # Apply EE delta via 6D IK
-        self._compute_ik(ee_delta)
-        self.data.ctrl[:7] = self._ee_target_joints
-        self.data.ctrl[7] = np.clip((1.0 - gripper_cmd) * 255.0, 0.0, 255.0)
-        mujoco.mj_step(self.model, self.data, nstep=50)
+        # Apply EE delta via 6D IK — 3 passes like PandaJointEnv.apply_ee_delta
+        for _ in range(3):
+            self._compute_ik(ee_delta / 3.0)
+            self.data.ctrl[:7] = self._ee_target_joints
+            self.data.ctrl[7] = np.clip((1.0 - gripper_cmd) * 255.0, 0.0, 255.0)
+            mujoco.mj_step(self.model, self.data, nstep=50)
         mujoco.mj_forward(self.model, self.data)
 
         self._step_count += 1
@@ -110,6 +115,17 @@ class PandaRLEnv:
         if truncated and not self._success:
             reward -= 5.0   # light — success +500 dominates
             self._rew_terminal -= 5.0
+
+        # Early termination: in grasp zone but no progress for 100 steps
+        _xy = float(np.linalg.norm(self.ee_position[:2] - self._init_cube[:2]))
+        _z = abs(self.ee_position[2] - (self._init_cube[2] + self.CUBE_HALF + 0.01))
+        _pose = float(np.sqrt(_xy**2 + _z**2))
+        if _pose < 0.12 and not self._grasped and not self._success:
+            self._idle_near += 1
+        else:
+            self._idle_near = 0
+        if self._idle_near > 100:
+            truncated = True
 
         return obs, reward, terminated, truncated, {}
 
@@ -236,30 +252,50 @@ class PandaRLEnv:
         return float(np.linalg.norm(self.ee_position - target))
 
     def _compute_reward(self, grasp_attempt: bool = False) -> float:
-        """Progress + grasp-pose bonus + grasp/success + attempt penalty."""
+        """Reward: progress outside zone or simple distance-based."""
+        # Simple mode for state-only PPO: pure distance + success
+        if getattr(self, '_simple_reward', False):
+            dist = self._dist_to_target()
+            progress = self._prev_dist - dist
+            r = 2.0 * progress  # strong direction signal
+            r -= 0.3 * dist      # distance penalty
+            if self._grasped and not getattr(self, '_grasp_bonus_given', False):
+                r += 50.0
+                self._grasp_bonus_given = True
+            if self._success and not getattr(self, '_success_bonus_given', False):
+                r += 500.0
+                self._success_bonus_given = True
+            r -= 0.005
+            self._prev_dist = dist
+            return float(r)
+
+        # Complex mode for PI0.5 residual PPO
         dist = self._dist_to_target()
-        # Use INITIAL cube position for XY/Z distance — fixed target, not pushed cube
         xy_dist = float(np.linalg.norm(self.ee_position[:2] - self._init_cube[:2]))
-        z_diff = abs(self.ee_position[2] - (self._init_cube[2] + self.CUBE_HALF + 0.01))
+        z_target = self._init_cube[2] + self.CUBE_HALF + 0.01
+        z_err = abs(self.ee_position[2] - z_target)
+        _pose = float(np.sqrt(xy_dist**2 + z_err**2))
 
-        progress = self._prev_dist - dist
-        r_prog = 2.0 * progress
-        r = r_prog
-        self._rew_progress += r_prog
+        # Outside grasp zone: weak progress reward
+        if _pose > 0.12:
+            progress = np.clip(self._prev_dist - dist, -0.01, 0.01)
+            r = 0.2 * progress
+            prev_z_err = abs(self._prev_ee[2] - z_target)
+            r += 3.0 * np.clip(prev_z_err - z_err, -0.005, 0.005)
+        else:
+            r = 0.0  # freeze — must grasp to earn
+        self._rew_progress += r
 
-        # Pose reward: XY × Z — both must be correct, not just XY
-        xy_score = max(0.0, 1.0 - xy_dist / 0.15)
-        z_diff = abs(self.ee_position[2] - (self.cube_position[2] + self.CUBE_HALF + 0.01))
-        z_score = max(0.0, 1.0 - z_diff / 0.10)
-        r_pose = 0.2 * xy_score * z_score  # heavily reduced — max ~0.2/step
-        r += r_pose
-        self._rew_pose += r_pose
+        # Track min distance for debugging
+        self._min_pose_dist = min(self._min_pose_dist, _pose)
+        if _pose < 0.12:
+            self._ever_near_grasp = True
 
-        # Grip reward: only when XY near AND Z close to grasp height
-        z_target = self.cube_position[2] + self.CUBE_HALF + 0.01
-        z_err_grip = abs(self.ee_position[2] - z_target)
-        if self.gripper_width < 0.04 and xy_dist < 0.08 and z_err_grip < 0.08:
-            r += 2.0  # meaningful: XY correct + Z close + grip closed
+        # Grip reward inside zone: closing = good
+        grip_change = self._prev_grip - self.gripper_width
+        if _pose < 0.12:
+            r += 50.0 * grip_change
+            self._rew_pose += 50.0 * grip_change
 
         # Grasp bonus (one-time)
         if self._grasped and not getattr(self, '_grasp_bonus_given', False):
@@ -267,23 +303,21 @@ class PandaRLEnv:
             self._rew_grasp += 100.0
             self._grasp_bonus_given = True
 
-        # Success bonus (dominant — must dwarf all other rewards)
+        # Flat reward for success — simple and correct
         if self._success and not getattr(self, '_success_bonus_given', False):
-            r += 500.0
-            self._rew_success += 500.0
+            r += 1000.0
+            self._rew_success += 1000.0
             self._success_bonus_given = True
 
-        # Grasp attempt penalty (one-time)
+        # Grasp attempt penalty (one-time, light)
         if grasp_attempt:
             penalty = 0.2 if dist < 0.10 else 1.0
             r -= penalty
             self._rew_attempt -= penalty
 
-        r_step = -0.005
-        r += r_step
-        self._rew_step += r_step
-
+        r -= 0.005  # step cost
         self._prev_dist = dist
+        self._prev_grip = self.gripper_width
         return float(r)
 
     def close(self):

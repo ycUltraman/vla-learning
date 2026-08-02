@@ -32,18 +32,19 @@ class PI05Stochastic(nn.Module):
         self.device = device
         self.residual_scale = res_scale  # configurable
 
-        # Residual head: bc_action + ee + cube + rel + dist + grip → correction
+        # Residual head: tiny random init → non-zero gradient for PPO
         # 7 + 3 + 3 + 3 + 1 + 1 = 18
         self.residual = nn.Sequential(
             nn.Linear(18, 64), nn.Tanh(),
             nn.Linear(64, 7),
         ).to(device)
-        nn.init.zeros_(self.residual[-1].weight)
+        # Tiny init: enough for gradient flow, not enough to destroy BC
+        nn.init.normal_(self.residual[-1].weight, std=0.001)
         nn.init.zeros_(self.residual[-1].bias)
 
-        # Learnable log_std for residual noise (very small)
-        self.log_std = nn.Parameter(torch.full((7,), -7.0, device=device))  # std ≈ 0.001, near-deterministic
-
+        # Unified log_std — grip gets no extra noise (BC handles it)
+        self.log_std_xyz = nn.Parameter(torch.full((6,), -7.0, device=device))
+        self.log_std_grip = nn.Parameter(torch.tensor(-7.0, device=device))  # tight, BC knows grip
         # Value head
         self.value_head = nn.Sequential(
             nn.Linear(hidden_dim, 512), nn.ReLU(),
@@ -68,6 +69,56 @@ class PI05Stochastic(nn.Module):
     def _hook_fn(self, module, input, output):
         self._action_features = output.detach()  # (batch, seq, dim)
 
+    def forward_train(self, raw_batch, bc_action_precomputed, xy_dist=None, cube_xyz=None):
+        """PPO update version — uses precomputed BC action, no select_action call."""
+        res_input = self._build_res_input(raw_batch, bc_action_precomputed, xy_dist, cube_xyz)
+        delta = self.residual(res_input)
+        delta = torch.clamp(delta, -self.residual_scale, self.residual_scale)
+
+        if xy_dist is not None:
+            if xy_dist > 0.30:   w = 0.0
+            elif xy_dist > 0.15: w = 0.5
+            elif xy_dist > 0.05: w = 0.8
+            else:                w = 1.0
+            delta_xyz = delta[:3] * w
+        else:
+            delta_xyz = delta[:3]
+
+        delta_z = torch.clamp(delta[2:3], -0.001, 0.003)
+        if xy_dist is not None and xy_dist < 0.06:
+            grip_val = delta[6:7] * 2.0
+        else:
+            grip_val = torch.zeros_like(delta[6:7])
+        delta = torch.cat([delta_xyz[:2], delta_z, delta[3:6], grip_val], dim=0)
+        mean = bc_action_precomputed + delta
+
+        std_xyz = torch.exp(self.log_std_xyz.clamp(-5, -2))
+        std_grip = torch.exp(self.log_std_grip.clamp(-5, -2))
+        std = torch.cat([std_xyz, std_grip.unsqueeze(0)])
+
+        if self._action_features is not None:
+            feat = self._action_features.mean(dim=1).squeeze(0)
+        else:
+            feat = torch.zeros(1024, device=self.device)
+        value = self.value_head(feat.float()).squeeze(-1)
+        return mean, std, value
+
+    def _build_res_input(self, raw_batch, bc_action, xy_dist, cube_xyz):
+        """Build normalized residual input without calling select_action."""
+        state = raw_batch["observation.state"][0]
+        ee_xyz = state[8:11] / 1.0
+        grip = state[7:8] / 0.08
+        dist_t = torch.tensor([xy_dist if xy_dist is not None else 0.0],
+                              device=self.device, dtype=torch.float32) / 0.5
+        if cube_xyz is not None:
+            cube_t = torch.tensor(cube_xyz, device=self.device, dtype=torch.float32) / 0.5
+            rel_xyz = cube_t - ee_xyz
+        else:
+            cube_t = torch.zeros(3, device=self.device)
+            rel_xyz = torch.zeros(3, device=self.device)
+        bc_norm = bc_action.detach() / 0.02
+        return torch.cat([bc_norm, ee_xyz, cube_t, rel_xyz, dist_t, grip])
+
     def forward(self, raw_batch, xy_dist=None, cube_xyz=None):
         """Run PI0.5 → bc_action, then add learnable residual correction.
 
@@ -76,7 +127,7 @@ class PI05Stochastic(nn.Module):
         """
         batch = self.preprocessor(raw_batch)
 
-        # Get BC action (deterministic, frozen)
+        # Get BC action
         with torch.no_grad():
             raw_action = self.pi05.select_action(batch)
             bc_action = self.postprocessor(raw_action).squeeze(0).to(self.device).clone()
@@ -117,12 +168,19 @@ class PI05Stochastic(nn.Module):
 
         # Tight Z clamp: XY matters more than Z for grasping
         delta_z = torch.clamp(delta[2:3], -0.001, 0.003)
-        delta = torch.cat([delta_xyz[:2], delta_z, delta[3:]], dim=0)
+        # Grip: only adjust in grasp zone, and only slightly — BC knows how to grip
+        if xy_dist is not None and xy_dist < 0.06:
+            grip_val = delta[6:7] * 2.0  # ×2, small correction
+        else:
+            grip_val = torch.zeros_like(delta[6:7])  # far: pure BC
+        delta = torch.cat([delta_xyz[:2], delta_z, delta[3:6], grip_val], dim=0)
 
         mean = bc_action + delta
 
-        # Small learnable noise
-        std = torch.exp(self.log_std.clamp(-5, -2))
+        # Tight std for all dims — BC handles grip
+        std_xyz = torch.exp(self.log_std_xyz.clamp(-5, -2))
+        std_grip = torch.exp(self.log_std_grip.clamp(-5, -2))
+        std = torch.cat([std_xyz, std_grip.unsqueeze(0)])
 
         # Value
         if self._action_features is not None:
@@ -233,8 +291,18 @@ def main():
     pi05 = pi05.merge_and_unload()
     pi05 = pi05.to(device=device, dtype=torch.float32)
 
-    # Selective freeze: vision + LLM + projector frozen, only action head trainable
-    trainable_keys = ['action', 'state_proj']
+    # Add fresh LoRA on vision encoder for PPO
+    # merge_and_unload bakes BC LoRA, then we add tiny trainable adapters
+    from peft import LoraConfig, get_peft_model
+    vis_pat = r".*vision_model\.encoder\.layers\.\d+\.self_attn\.(q_proj|v_proj|out_proj)"
+    vis_lora = LoraConfig(r=8, lora_alpha=8, target_modules=vis_pat,
+                          lora_dropout=0.0, bias="none",
+                          task_type="FEATURE_EXTRACTION")
+    pi05 = get_peft_model(pi05, vis_lora, adapter_name="ppo_vision")
+    print("Vision LoRA added (r=4)")
+
+    # Selective freeze: only action head + vision LoRA trainable
+    trainable_keys = ['action', 'state_proj', 'lora_A', 'lora_B']
     n_trainable = 0
     for name, p in pi05.named_parameters():
         if any(k in name for k in trainable_keys):
@@ -242,7 +310,8 @@ def main():
             n_trainable += p.numel()
         else:
             p.requires_grad = False
-    print(f"PI0.5 trainable: {n_trainable/1e6:.1f}M params (action head only)")
+    n_lora = sum(1 for n,_ in pi05.named_parameters() if 'lora_' in n and n.endswith(('.weight','.bias')))
+    print(f"PI0.5 trainable: {n_trainable/1e6:.1f}M params (action head + {n_lora} LoRA params)")
 
     # Load preprocessor + postprocessor (handles resize, normalize, unnormalize)
     preprocessor, postprocessor = make_pre_post_processors(
@@ -265,6 +334,8 @@ def main():
     success_count = 0
 
     for ep in range(args.episodes):
+        # Clear PI0.5 action queue — PPO updates may have polluted it
+        policy.pi05._action_queue.clear()
         obs_dict = env.reset()[0] if isinstance(env.reset(), tuple) else env.reset()
         obs_dict = env.get_obs_pi05()
         done = False
@@ -276,27 +347,31 @@ def main():
         ep_ppo = []        # PPO mean (bc + residual)
 
         while not done:
-            batch = build_batch(obs_dict, device)
-            # Compute EE-cube distance + cube position for residual context
-            ee_xy = obs_dict["observation.state"][8:11][:2]
-            cube_pos = env.cube_position.copy()
-            xy_dist = float(np.linalg.norm(ee_xy - cube_pos[:2]))
+            # PPO policy = PI0.5 action head (gradient flows via select_action)
+            proc_batch = preprocessor(build_batch(obs_dict, device))
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                action, log_prob, value, ppo_mean, bc_mean = policy.act(
-                    batch, xy_dist=xy_dist, cube_xyz=cube_pos)
+                raw = pi05.select_action(proc_batch)
+            action_t = postprocessor(raw).squeeze(0).to(device)  # keep grad!
 
-            action_np = action.detach().cpu().numpy()
-            ppo_np = ppo_mean.detach().cpu().numpy()
-            bc_np = bc_mean.detach().cpu().numpy()
-            ep_residuals.append(np.abs(ppo_np - bc_np))
-            ep_bc.append(bc_np.copy())
-            ep_ppo.append(ppo_np.copy())
-            # Clip EE delta to safe range (±0.05m per step)
+            # Add tiny noise for exploration
+            std_t = torch.exp(policy.log_std_xyz.clamp(-5, -2))
+            std_g = torch.exp(policy.log_std_grip.clamp(-5, -2))
+            std_full = torch.cat([std_t, std_g.unsqueeze(0)])
+            dist = torch.distributions.Normal(action_t, std_full)
+            action_sample = dist.rsample()  # reparameterized sample
+            log_prob_t = dist.log_prob(action_sample).sum()
+
+            action_np = action_sample.detach().cpu().numpy()
+            bc_np = action_t.detach().cpu().numpy()
+            val_t = policy.value_head(torch.zeros(1024, device=device)).squeeze(-1)
+            ep_residuals.append(np.zeros(7))
+            ep_bc.append(bc_np)
+            ep_ppo.append(bc_np)
+            # Clip EE delta to safe range
             action_np[:3] = np.clip(action_np[:3], -0.05, 0.05)
             ep_actions.append(action_np.copy())
-            # PI0.5 outputs 7D [dx,dy,dz,drx,dry,drz,grip]
-            # RL env expects 4D [dx,dy,dz,grip]
+            # Map 7D → 4D for env
             rl_action = np.array([
                 action_np[0], action_np[1], action_np[2], action_np[6]
             ])
@@ -305,9 +380,12 @@ def main():
             done = terminated or truncated
             ep_reward += reward
 
-            buffer.add(obs_dict, action.detach(),
-                       reward, log_prob.detach(), value.detach(),
-                       bc_mean.detach(), done)  # bc_mean = pure frozen BC output
+            # Store in buffer
+            _act = torch.tensor(action_np, device=device, dtype=torch.float32)
+            _lp = log_prob_t.detach() if torch.is_tensor(log_prob_t) else torch.tensor(0.0, device=device)
+            _val = val_t.detach() if torch.is_tensor(val_t) else torch.tensor(0.0, device=device)
+            _bc = torch.tensor(bc_np, device=device, dtype=torch.float32)
+            buffer.add(obs_dict, _act.detach(), reward, _lp, _val, _bc.detach(), done)
 
             obs_dict = env.get_obs_pi05()
 
@@ -329,10 +407,16 @@ def main():
                 print(f"  [debug] adv mean={adv_t.mean():+.4f} std={adv_t.std():.4f} "
                       f"ret mean={ret_t.mean():+.2f}")
 
-            for _ in range(5):
+            # Tiered replay: success=10, near-miss=3, failure=1
+            if env._success:      n_epochs = 10
+            elif env._grasped:    n_epochs = 3
+            else:                 n_epochs = 1
+            for _ in range(n_epochs):
                 for t in range(n):
                     batch_t = build_batch(buffer.obs[t], device)
-                    mean_t, std_t, _, _ = policy.forward(batch_t)
+                    # Use forward_train with precomputed BC action — no select_action call
+                    mean_t, std_t, val_t = policy.forward_train(
+                        batch_t, bc_means_t[t], xy_dist=None, cube_xyz=None)
                     dist = Normal(mean_t, std_t)
                     new_lp = dist.log_prob(actions_t[t]).sum()
                     old_lp = log_probs_t[t]
@@ -341,11 +425,10 @@ def main():
                     surr2 = torch.clamp(ratio, 0.8, 1.2) * adv_t[t]
                     policy_loss = -torch.min(surr1, surr2)
 
-                    # BC regularization: protect BC from harmful deviation
-                    bc_loss = args.bc_loss * ((mean_t - bc_means_t[t]) ** 2).sum()
+                    # BC reg: 0 for first 10 eps (PPO explores), then ramp up
+                    bc_weight = args.bc_loss * min(1.0, max(0.0, (ep - 10) / 10.0))
+                    bc_loss = bc_weight * ((mean_t - bc_means_t[t]) ** 2).sum()
 
-                    # Value loss
-                    _, _, val_t, _ = policy.forward(batch_t)
                     value_loss = nn.functional.mse_loss(val_t, ret_t[t])
 
                     loss = policy_loss + bc_loss + 0.5 * value_loss
@@ -370,20 +453,25 @@ def main():
             resids = np.array(ep_residuals)
             # 1 line: residual magnitude (dx,dy,dz,grip only — key diagnostic)
             print(f"  residual dx={resids[:,0].mean():.4f} dy={resids[:,1].mean():.4f} dz={resids[:,2].mean():.4f} grip={resids[:,6].mean():.4f}")
-            # 1 line: BC vs PPO (mean, no noise) at step 0
+            # 1 line: BC vs PPO at step 0 (dx,dy,dz,grip)
             if ep_bc and ep_ppo:
                 bc0, ppo0 = ep_bc[0], ep_ppo[0]
-                print(f"  BC=({bc0[0]:+.4f},{bc0[1]:+.4f},{bc0[2]:+.4f}) PPO=({ppo0[0]:+.4f},{ppo0[1]:+.4f},{ppo0[2]:+.4f})")
+                print(f"  BC=({bc0[0]:+.4f},{bc0[1]:+.4f},{bc0[2]:+.4f},{bc0[6]:+.4f}) PPO=({ppo0[0]:+.4f},{ppo0[1]:+.4f},{ppo0[2]:+.4f},{ppo0[6]:+.4f})")
             # 1 line: trajectory final state (init cube = fixed target, current = may be pushed)
             cube_init = getattr(env, '_init_cube', env.cube_position)
             cube_cur, ee = env.cube_position, env.ee_position
             print(f"  cube_init=({cube_init[0]:.2f},{cube_init[1]:.2f},{cube_init[2]:.3f}) cube_now=({cube_cur[0]:.2f},{cube_cur[1]:.2f},{cube_cur[2]:.3f}) ee=({ee[0]:.3f},{ee[1]:.3f},{ee[2]:.3f}) xy_to_init={np.linalg.norm(ee[:2]-cube_init[:2]):.3f} grasped={env._grasped}")
             print(f"  rew: prog={env._rew_progress:+.1f} pose={env._rew_pose:+.1f} grasp={env._rew_grasp:+.1f} succ={env._rew_success:+.1f} att={env._rew_attempt:+.1f} step={env._rew_step:+.1f} term={env._rew_terminal:+.1f}")
+            print(f"  min_pose_dist={getattr(env,'_min_pose_dist',99):.3f} ever_near={getattr(env,'_ever_near_grasp',False)}")
+            with torch.no_grad():
+                grip_std_val = torch.exp(policy.log_std_grip).item()
+            print(f"  grip_std={grip_std_val:.4f} ppo_grip_mean={ep_ppo[0][6]:+.4f}")
 
     total_time = time.time() - t_start
     print(f"\nDone. {args.episodes} episodes in {total_time/60:.0f}min")
     torch.save({
-        "log_std": policy.log_std.data,
+        "log_std_xyz": policy.log_std_xyz.data,
+        "log_std_grip": policy.log_std_grip.data,
         "value_head": policy.value_head.state_dict(),
     }, args.save)
     env.close()
